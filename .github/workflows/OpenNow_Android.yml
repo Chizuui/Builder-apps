@@ -90,9 +90,19 @@ jobs:
         run: |
           set -e
 
-          echo "Cloning repository:"
+          echo "============================================"
+          echo "Clone Target Repository"
+          echo "============================================"
+          echo ""
+
+          echo "Repository:"
           echo "https://github.com/${{ github.event.inputs.repository }}"
-          echo "Branch: ${{ github.event.inputs.branch }}"
+
+          echo ""
+          echo "Branch:"
+          echo "${{ github.event.inputs.branch }}"
+
+          echo ""
 
           git clone \
             --recursive \
@@ -130,14 +140,26 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
+
+      # ============================================================
+      # Accept Android SDK Licenses
+      # ============================================================
+
       - name: Accept SDK Licenses
         shell: bash
         run: |
           yes | sdkmanager --licenses || true
 
+
+      # ============================================================
+      # Install Android SDK Components
+      # ============================================================
+
       - name: Install Android SDK Components
         shell: bash
         run: |
+          set -e
+
           sdkmanager \
             "platform-tools" \
             "platforms;android-36" \
@@ -147,27 +169,58 @@ jobs:
 
 
       # ============================================================
+      # Add Android Build Tools to PATH
+      #
+      # Ini yang memperbaiki:
+      #
+      # apksigner: command not found
+      # ============================================================
+
+      - name: Add Android Build Tools to PATH
+        shell: bash
+        run: |
+          set -e
+
+          BUILD_TOOLS_PATH="$ANDROID_HOME/build-tools/36.0.0"
+
+          echo "Android Build Tools:"
+          echo "$BUILD_TOOLS_PATH"
+
+          if [ ! -d "$BUILD_TOOLS_PATH" ]; then
+            echo "::error::Android Build Tools 36.0.0 tidak ditemukan."
+            exit 1
+          fi
+
+          echo "$BUILD_TOOLS_PATH" >> "$GITHUB_PATH"
+
+          echo ""
+          echo "Build Tools directory:"
+          ls -la "$BUILD_TOOLS_PATH"
+
+
+      # ============================================================
       # Gradle
       # ============================================================
 
       - name: Make gradlew executable
         working-directory: source/android
         shell: bash
-        run: chmod +x gradlew
+        run: |
+          chmod +x gradlew
 
 
       # ============================================================
       # Install Builder Debug Keystore
       #
-      # IMPORTANT:
-      # Step ini SELALU jalan untuk Debug maupun Release.
+      # SELALU dijalankan untuk Debug dan Release.
       #
-      # Jadi jika build.gradle Release menggunakan:
+      # Jika build.gradle.kts mempunyai:
       #
-      # signingConfig = signingConfigs.getByName("debug")
+      # release {
+      #     signingConfig = signingConfigs.getByName("debug")
+      # }
       #
-      # maka Release juga akan menggunakan debug.keystore
-      # milik Builder-apps.
+      # maka assembleRelease akan menggunakan keystore ini juga.
       # ============================================================
 
       - name: Install Builder Debug Keystore
@@ -180,15 +233,15 @@ jobs:
           ANDROID_KEYSTORE="$ANDROID_DIR/debug.keystore"
 
           echo "============================================"
-          echo "Installing Builder-apps debug.keystore"
+          echo "Install Builder Debug Keystore"
           echo "============================================"
           echo ""
 
-          echo "Source:"
+          echo "Builder keystore:"
           echo "$BUILDER_KEYSTORE"
 
           echo ""
-          echo "Destination:"
+          echo "Android debug keystore:"
           echo "$ANDROID_KEYSTORE"
 
           echo ""
@@ -200,12 +253,13 @@ jobs:
 
           mkdir -p "$ANDROID_DIR"
 
-          # Hapus keystore bawaan / hasil generate runner jika ada
+          # Hapus keystore bawaan runner kalau sudah ada
           rm -f "$ANDROID_KEYSTORE"
 
-          # Copy debug keystore dari Builder-apps
+          # Copy debug.keystore Builder-apps
           cp "$BUILDER_KEYSTORE" "$ANDROID_KEYSTORE"
 
+          # Permission file
           chmod 600 "$ANDROID_KEYSTORE"
 
           echo ""
@@ -215,12 +269,12 @@ jobs:
           ls -lh "$ANDROID_KEYSTORE"
 
           echo ""
-          echo "File SHA256:"
+          echo "Keystore SHA256:"
           sha256sum "$ANDROID_KEYSTORE"
 
 
       # ============================================================
-      # Verify Debug Keystore
+      # Verify Builder Debug Keystore
       # ============================================================
 
       - name: Verify Builder Debug Keystore
@@ -231,12 +285,12 @@ jobs:
           KEYSTORE="$HOME/.android/debug.keystore"
 
           echo "============================================"
-          echo "Verifying Android Debug Keystore"
+          echo "Verify Debug Keystore"
           echo "============================================"
           echo ""
 
           if [ ! -f "$KEYSTORE" ]; then
-            echo "::error::Installed debug.keystore tidak ditemukan."
+            echo "::error::debug.keystore tidak ditemukan."
             exit 1
           fi
 
@@ -263,11 +317,11 @@ jobs:
           set -e
 
           echo "============================================"
-          echo "Building Android RELEASE"
+          echo "Build Android RELEASE"
           echo "============================================"
           echo ""
 
-          echo "Installed debug keystore:"
+          echo "Debug keystore SHA256:"
           sha256sum "$HOME/.android/debug.keystore"
 
           echo ""
@@ -290,11 +344,11 @@ jobs:
           set -e
 
           echo "============================================"
-          echo "Building Android DEBUG"
+          echo "Build Android DEBUG"
           echo "============================================"
           echo ""
 
-          echo "Installed debug keystore:"
+          echo "Debug keystore SHA256:"
           sha256sum "$HOME/.android/debug.keystore"
 
           echo ""
@@ -306,25 +360,40 @@ jobs:
 
 
       # ============================================================
-      # Show Build Outputs
+      # Show Built APKs
       # ============================================================
 
       - name: Show Built APKs
         shell: bash
         run: |
+          set -e
+
           echo "============================================"
           echo "Built APK files"
           echo "============================================"
           echo ""
 
-          find source/android/app/build/outputs \
-            -type f \
-            -name "*.apk" \
-            -print || true
+          APK_FOUND=false
+
+          while IFS= read -r apk; do
+            APK_FOUND=true
+            echo "$apk"
+          done < <(
+            find source/android/app/build/outputs \
+              -type f \
+              -name "*.apk"
+          )
+
+          if [ "$APK_FOUND" = false ]; then
+            echo "::error::Tidak ada APK yang ditemukan."
+            exit 1
+          fi
 
 
       # ============================================================
       # Verify APK Signature
+      #
+      # Pakai absolute path agar tidak tergantung PATH runner.
       # ============================================================
 
       - name: Verify APK Signature
@@ -337,19 +406,37 @@ jobs:
           echo "============================================"
           echo ""
 
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+
+          echo "Using apksigner:"
+          echo "$APKSIGNER"
+
+          echo ""
+
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "::error::apksigner tidak ditemukan di:"
+            echo "$APKSIGNER"
+
+            echo ""
+            echo "Available Android build-tools:"
+            ls -la "$ANDROID_HOME/build-tools" || true
+
+            exit 1
+          fi
+
           APK_FOUND=false
 
           while IFS= read -r apk; do
             APK_FOUND=true
 
             echo ""
-            echo "--------------------------------------------"
+            echo "============================================"
             echo "APK:"
             echo "$apk"
-            echo "--------------------------------------------"
+            echo "============================================"
             echo ""
 
-            apksigner verify \
+            "$APKSIGNER" verify \
               --verbose \
               --print-certs \
               "$apk"
@@ -392,27 +479,40 @@ jobs:
 
           TAG="${{ github.event.inputs.tag }}"
 
-          # Git tags tidak boleh memiliki spasi
+          # Ganti spasi dengan dash
           TAG=$(echo "$TAG" | tr ' ' '-')
 
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
 
-          echo "Release tag:"
+          echo "============================================"
+          echo "Release Tag"
+          echo "============================================"
+          echo ""
           echo "$TAG"
 
 
       # ============================================================
-      # Release Type
+      # Set Release Type
       # ============================================================
 
       - name: Set Release Type
         if: github.event.inputs.publish_release == 'true'
         shell: bash
         run: |
+          set -e
+
           if [ "${{ github.event.inputs.release_type }}" == "Prerelease" ]; then
+
             echo "IS_PRERELEASE=true" >> "$GITHUB_ENV"
+
+            echo "Release type: Prerelease"
+
           else
+
             echo "IS_PRERELEASE=false" >> "$GITHUB_ENV"
+
+            echo "Release type: Release"
+
           fi
 
 
@@ -447,7 +547,8 @@ jobs:
 
               echo "Processing commit URL: $link" >&2
 
-              # Format expected:
+              # Expected:
+              #
               # https://github.com/OWNER/REPO/commit/HASH
 
               if [[ "$link" =~ github\.com/([^/]+)/([^/]+)/commit/([a-fA-F0-9]+) ]]; then
@@ -545,11 +646,15 @@ jobs:
               echo "release_body<<EOF"
 
               if [ -f /tmp/commit_description.txt ]; then
+
                 cat /tmp/commit_description.txt
+
               else
+
                 echo "## Changelog"
                 echo ""
                 echo "Commit description unavailable."
+
               fi
 
               echo "EOF"
