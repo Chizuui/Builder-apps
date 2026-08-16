@@ -80,6 +80,7 @@ jobs:
       - name: Checkout Builder Repository
         uses: actions/checkout@v4
 
+
       # ============================================================
       # Clone Target Repository
       # ============================================================
@@ -130,9 +131,12 @@ jobs:
         uses: android-actions/setup-android@v3
 
       - name: Accept SDK Licenses
-        run: yes | sdkmanager --licenses || true
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses || true
 
       - name: Install Android SDK Components
+        shell: bash
         run: |
           sdkmanager \
             "platform-tools" \
@@ -148,44 +152,70 @@ jobs:
 
       - name: Make gradlew executable
         working-directory: source/android
+        shell: bash
         run: chmod +x gradlew
 
 
       # ============================================================
-      # Builder Debug Keystore
+      # Install Builder Debug Keystore
+      #
+      # IMPORTANT:
+      # Step ini SELALU jalan untuk Debug maupun Release.
+      #
+      # Jadi jika build.gradle Release menggunakan:
+      #
+      # signingConfig = signingConfigs.getByName("debug")
+      #
+      # maka Release juga akan menggunakan debug.keystore
+      # milik Builder-apps.
       # ============================================================
 
       - name: Install Builder Debug Keystore
-        if: github.event.inputs.build_type == 'Debug'
         shell: bash
         run: |
           set -e
 
           BUILDER_KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
-          ANDROID_KEYSTORE="$HOME/.android/debug.keystore"
+          ANDROID_DIR="$HOME/.android"
+          ANDROID_KEYSTORE="$ANDROID_DIR/debug.keystore"
 
-          echo "Installing Builder debug keystore..."
+          echo "============================================"
+          echo "Installing Builder-apps debug.keystore"
+          echo "============================================"
+          echo ""
+
+          echo "Source:"
+          echo "$BUILDER_KEYSTORE"
+
+          echo ""
+          echo "Destination:"
+          echo "$ANDROID_KEYSTORE"
+
+          echo ""
 
           if [ ! -f "$BUILDER_KEYSTORE" ]; then
-            echo "::error::debug.keystore tidak ditemukan di Builder repository."
+            echo "::error::debug.keystore tidak ditemukan di root Builder-apps."
             exit 1
           fi
 
-          mkdir -p "$HOME/.android"
+          mkdir -p "$ANDROID_DIR"
 
-          # Hapus debug keystore bawaan runner jika ada
+          # Hapus keystore bawaan / hasil generate runner jika ada
           rm -f "$ANDROID_KEYSTORE"
 
-          # Gunakan debug.keystore milik Builder-apps
+          # Copy debug keystore dari Builder-apps
           cp "$BUILDER_KEYSTORE" "$ANDROID_KEYSTORE"
 
           chmod 600 "$ANDROID_KEYSTORE"
 
-          echo "Debug keystore installed:"
+          echo ""
+          echo "Keystore berhasil dipasang."
+          echo ""
+
           ls -lh "$ANDROID_KEYSTORE"
 
           echo ""
-          echo "Keystore SHA256:"
+          echo "File SHA256:"
           sha256sum "$ANDROID_KEYSTORE"
 
 
@@ -193,17 +223,25 @@ jobs:
       # Verify Debug Keystore
       # ============================================================
 
-      - name: Verify Debug Keystore
-        if: github.event.inputs.build_type == 'Debug'
+      - name: Verify Builder Debug Keystore
         shell: bash
         run: |
           set -e
 
           KEYSTORE="$HOME/.android/debug.keystore"
 
-          echo "Checking debug keystore..."
+          echo "============================================"
+          echo "Verifying Android Debug Keystore"
+          echo "============================================"
+          echo ""
 
-          keytool -list \
+          if [ ! -f "$KEYSTORE" ]; then
+            echo "::error::Installed debug.keystore tidak ditemukan."
+            exit 1
+          fi
+
+          keytool \
+            -list \
             -v \
             -keystore "$KEYSTORE" \
             -storepass android \
@@ -220,7 +258,20 @@ jobs:
       - name: Build Release
         if: github.event.inputs.build_type == 'Release'
         working-directory: source/android
+        shell: bash
         run: |
+          set -e
+
+          echo "============================================"
+          echo "Building Android RELEASE"
+          echo "============================================"
+          echo ""
+
+          echo "Installed debug keystore:"
+          sha256sum "$HOME/.android/debug.keystore"
+
+          echo ""
+
           ./gradlew \
             assembleRelease \
             --stacktrace \
@@ -234,8 +285,19 @@ jobs:
       - name: Build Debug
         if: github.event.inputs.build_type == 'Debug'
         working-directory: source/android
+        shell: bash
         run: |
-          echo "Building Debug APK using Builder-apps debug.keystore..."
+          set -e
+
+          echo "============================================"
+          echo "Building Android DEBUG"
+          echo "============================================"
+          echo ""
+
+          echo "Installed debug keystore:"
+          sha256sum "$HOME/.android/debug.keystore"
+
+          echo ""
 
           ./gradlew \
             assembleDebug \
@@ -244,17 +306,21 @@ jobs:
 
 
       # ============================================================
-      # Find Built APKs
+      # Show Build Outputs
       # ============================================================
 
       - name: Show Built APKs
         shell: bash
         run: |
-          echo "Built APK files:"
+          echo "============================================"
+          echo "Built APK files"
+          echo "============================================"
+          echo ""
+
           find source/android/app/build/outputs \
             -type f \
             -name "*.apk" \
-            -print
+            -print || true
 
 
       # ============================================================
@@ -266,7 +332,9 @@ jobs:
         run: |
           set -e
 
-          echo "Verifying APK signatures..."
+          echo "============================================"
+          echo "APK Signature Verification"
+          echo "============================================"
           echo ""
 
           APK_FOUND=false
@@ -274,9 +342,12 @@ jobs:
           while IFS= read -r apk; do
             APK_FOUND=true
 
-            echo "================================================"
-            echo "APK: $apk"
-            echo "================================================"
+            echo ""
+            echo "--------------------------------------------"
+            echo "APK:"
+            echo "$apk"
+            echo "--------------------------------------------"
+            echo ""
 
             apksigner verify \
               --verbose \
@@ -284,6 +355,7 @@ jobs:
               "$apk"
 
             echo ""
+
           done < <(
             find source/android/app/build/outputs \
               -type f \
@@ -297,7 +369,7 @@ jobs:
 
 
       # ============================================================
-      # Upload Artifact
+      # Upload APK Artifact
       # ============================================================
 
       - name: Upload APK Artifact
@@ -309,21 +381,24 @@ jobs:
 
 
       # ============================================================
-      # Release Tag
+      # Prepare Release Tag
       # ============================================================
 
       - name: Prepare Release Tag
         if: github.event.inputs.publish_release == 'true'
         shell: bash
         run: |
+          set -e
+
           TAG="${{ github.event.inputs.tag }}"
 
-          # Git tag tidak boleh menggunakan spasi
+          # Git tags tidak boleh memiliki spasi
           TAG=$(echo "$TAG" | tr ' ' '-')
 
           echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
 
-          echo "Release tag: $TAG"
+          echo "Release tag:"
+          echo "$TAG"
 
 
       # ============================================================
@@ -342,7 +417,7 @@ jobs:
 
 
       # ============================================================
-      # Commit Description
+      # Extract Commit Messages
       # ============================================================
 
       - name: Extract Commit Messages
@@ -362,6 +437,7 @@ jobs:
             echo ""
 
             for link in "${LINKS[@]}"; do
+
               # Trim whitespace
               link=$(echo "$link" | xargs)
 
@@ -369,8 +445,10 @@ jobs:
                 continue
               fi
 
-              echo "Processing:"
-              echo "$link" >&2
+              echo "Processing commit URL: $link" >&2
+
+              # Format expected:
+              # https://github.com/OWNER/REPO/commit/HASH
 
               if [[ "$link" =~ github\.com/([^/]+)/([^/]+)/commit/([a-fA-F0-9]+) ]]; then
 
@@ -402,25 +480,32 @@ jobs:
                     | sed '/^$/d')
 
                   if [ -n "$COMMIT_BODY" ]; then
+
                     echo '```'
                     echo "$COMMIT_BODY"
                     echo '```'
                     echo ""
+
                   fi
 
                 else
+
                   echo "### [$SHORT_HASH]($link)"
                   echo ""
                   echo "_Commit message tidak dapat diambil._"
                   echo ""
+
                 fi
 
               else
+
                 echo "### $link"
                 echo ""
                 echo "_Invalid GitHub commit URL._"
                 echo ""
+
               fi
+
             done
 
           } > /tmp/commit_description.txt
@@ -433,7 +518,7 @@ jobs:
 
 
       # ============================================================
-      # Determine Release Description
+      # Determine Release Body
       # ============================================================
 
       - name: Determine Release Body
@@ -444,6 +529,8 @@ jobs:
           MANUAL_DESC: ${{ github.event.inputs.manual_description }}
           COMMIT_LINKS: ${{ github.event.inputs.commit_links }}
         run: |
+          set -e
+
           if [ -z "$COMMIT_LINKS" ]; then
 
             {
@@ -466,13 +553,14 @@ jobs:
               fi
 
               echo "EOF"
+
             } >> "$GITHUB_OUTPUT"
 
           fi
 
 
       # ============================================================
-      # GitHub Release
+      # Publish GitHub Release
       # ============================================================
 
       - name: Publish GitHub Release
