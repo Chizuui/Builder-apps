@@ -14,7 +14,7 @@ on:
       branch:
         description: Branch
         required: true
-        default: android-native-live-features
+        default: chizui-dev-bak
 
       build_type:
         description: Build Type
@@ -41,9 +41,9 @@ on:
           - Prerelease
 
       tag:
-        description: Release Tag (boleh pakai spasi)
+        description: Release Tag
         required: true
-        default: v1.0.0 Build 1
+        default: v1.0.0-build-1
 
       release_title:
         description: Release Title
@@ -51,79 +51,52 @@ on:
         default: OpenNOW Android
 
       commit_links:
-        description: 'Commit links (pipe-separated: link1 | link2 | link3)'
+        description: Commit links, separated by |
         required: false
-        default: ''
+        default: ""
 
       manual_description:
-        description: Release Description (gunakan jika commit_links kosong)
+        description: Release description
         required: false
         default: |
           ## Changelog
           - Built with GitHub Actions
           - Latest features included
 
-
 jobs:
   build:
+    name: Build Android
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     env:
       GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx8g"
 
     steps:
-      # ============================================================
-      # Checkout Builder Repository
-      # ============================================================
-
       - name: Checkout Builder Repository
         uses: actions/checkout@v4
 
-
-      # ============================================================
-      # Clone Target Repository
-      # ============================================================
-
       - name: Clone Target Repository
         shell: bash
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+          TARGET_BRANCH: ${{ inputs.branch }}
         run: |
-          set -e
-
-          echo "============================================"
-          echo "Clone Target Repository"
-          echo "============================================"
-          echo ""
-
-          echo "Repository:"
-          echo "https://github.com/${{ github.event.inputs.repository }}"
-
-          echo ""
-          echo "Branch:"
-          echo "${{ github.event.inputs.branch }}"
-
-          echo ""
+          set -euo pipefail
 
           git clone \
             --recursive \
-            --branch "${{ github.event.inputs.branch }}" \
-            "https://github.com/${{ github.event.inputs.repository }}.git" \
+            --branch "$TARGET_BRANCH" \
+            "https://github.com/$TARGET_REPOSITORY.git" \
             source
 
           cd source
-
-          echo ""
-          echo "Current commit:"
-          git log -1 --oneline
-
-          echo ""
-          echo "Updating submodules..."
           git submodule update --init --recursive
 
-
-      # ============================================================
-      # Java
-      # ============================================================
+          echo "Target repository: $TARGET_REPOSITORY"
+          echo "Target branch: $TARGET_BRANCH"
+          echo "Target commit:"
+          git log -1 --oneline
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -132,33 +105,42 @@ jobs:
           java-version: "21"
           cache: gradle
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
 
-      # ============================================================
-      # Android SDK
-      # ============================================================
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >
+            aarch64-linux-android,
+            armv7-linux-androideabi,
+            x86_64-linux-android,
+            i686-linux-android
+
+      - name: Verify Build Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 --version
+          rustc --version
+          cargo --version
+          rustup target list --installed
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-
-      # ============================================================
-      # Accept Android SDK Licenses
-      # ============================================================
-
-      - name: Accept SDK Licenses
+      - name: Accept Android SDK Licenses
         shell: bash
         run: |
           yes | sdkmanager --licenses || true
 
-
-      # ============================================================
-      # Install Android SDK Components
-      # ============================================================
-
       - name: Install Android SDK Components
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           sdkmanager \
             "platform-tools" \
@@ -167,211 +149,88 @@ jobs:
             "cmake;3.22.1" \
             "ndk;29.0.13846066"
 
-
-      # ============================================================
-      # Add Android Build Tools to PATH
-      #
-      # Ini yang memperbaiki:
-      #
-      # apksigner: command not found
-      # ============================================================
-
       - name: Add Android Build Tools to PATH
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           BUILD_TOOLS_PATH="$ANDROID_HOME/build-tools/36.0.0"
 
-          echo "Android Build Tools:"
-          echo "$BUILD_TOOLS_PATH"
-
           if [ ! -d "$BUILD_TOOLS_PATH" ]; then
-            echo "::error::Android Build Tools 36.0.0 tidak ditemukan."
+            echo "::error::Android Build Tools tidak ditemukan."
             exit 1
           fi
 
           echo "$BUILD_TOOLS_PATH" >> "$GITHUB_PATH"
 
-          echo ""
-          echo "Build Tools directory:"
-          ls -la "$BUILD_TOOLS_PATH"
+      - name: Install Builder Debug Keystore
+        shell: bash
+        run: |
+          set -euo pipefail
 
+          SOURCE_KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
+          TARGET_DIR="$HOME/.android"
+          TARGET_KEYSTORE="$TARGET_DIR/debug.keystore"
 
-      # ============================================================
-      # Gradle
-      # ============================================================
+          if [ ! -f "$SOURCE_KEYSTORE" ]; then
+            echo "::error::debug.keystore tidak ditemukan di root builder repository."
+            exit 1
+          fi
 
-      - name: Make gradlew executable
+          mkdir -p "$TARGET_DIR"
+          rm -f "$TARGET_KEYSTORE"
+          cp "$SOURCE_KEYSTORE" "$TARGET_KEYSTORE"
+          chmod 600 "$TARGET_KEYSTORE"
+
+          echo "Debug keystore SHA256:"
+          sha256sum "$TARGET_KEYSTORE"
+
+      - name: Verify Debug Keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          keytool \
+            -list \
+            -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey
+
+      - name: Make Gradle Executable
         working-directory: source/android
         shell: bash
         run: |
           chmod +x gradlew
 
-
-      # ============================================================
-      # Install Builder Debug Keystore
-      #
-      # SELALU dijalankan untuk Debug dan Release.
-      #
-      # Jika build.gradle.kts mempunyai:
-      #
-      # release {
-      #     signingConfig = signingConfigs.getByName("debug")
-      # }
-      #
-      # maka assembleRelease akan menggunakan keystore ini juga.
-      # ============================================================
-
-      - name: Install Builder Debug Keystore
-        shell: bash
-        run: |
-          set -e
-
-          BUILDER_KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
-          ANDROID_DIR="$HOME/.android"
-          ANDROID_KEYSTORE="$ANDROID_DIR/debug.keystore"
-
-          echo "============================================"
-          echo "Install Builder Debug Keystore"
-          echo "============================================"
-          echo ""
-
-          echo "Builder keystore:"
-          echo "$BUILDER_KEYSTORE"
-
-          echo ""
-          echo "Android debug keystore:"
-          echo "$ANDROID_KEYSTORE"
-
-          echo ""
-
-          if [ ! -f "$BUILDER_KEYSTORE" ]; then
-            echo "::error::debug.keystore tidak ditemukan di root Builder-apps."
-            exit 1
-          fi
-
-          mkdir -p "$ANDROID_DIR"
-
-          # Hapus keystore bawaan runner kalau sudah ada
-          rm -f "$ANDROID_KEYSTORE"
-
-          # Copy debug.keystore Builder-apps
-          cp "$BUILDER_KEYSTORE" "$ANDROID_KEYSTORE"
-
-          # Permission file
-          chmod 600 "$ANDROID_KEYSTORE"
-
-          echo ""
-          echo "Keystore berhasil dipasang."
-          echo ""
-
-          ls -lh "$ANDROID_KEYSTORE"
-
-          echo ""
-          echo "Keystore SHA256:"
-          sha256sum "$ANDROID_KEYSTORE"
-
-
-      # ============================================================
-      # Verify Builder Debug Keystore
-      # ============================================================
-
-      - name: Verify Builder Debug Keystore
-        shell: bash
-        run: |
-          set -e
-
-          KEYSTORE="$HOME/.android/debug.keystore"
-
-          echo "============================================"
-          echo "Verify Debug Keystore"
-          echo "============================================"
-          echo ""
-
-          if [ ! -f "$KEYSTORE" ]; then
-            echo "::error::debug.keystore tidak ditemukan."
-            exit 1
-          fi
-
-          keytool \
-            -list \
-            -v \
-            -keystore "$KEYSTORE" \
-            -storepass android \
-            -alias androiddebugkey
-
-          echo ""
-          echo "Debug keystore verified successfully."
-
-
-      # ============================================================
-      # Build Release
-      # ============================================================
-
       - name: Build Release
-        if: github.event.inputs.build_type == 'Release'
+        if: inputs.build_type == 'Release'
         working-directory: source/android
         shell: bash
         run: |
-          set -e
-
-          echo "============================================"
-          echo "Build Android RELEASE"
-          echo "============================================"
-          echo ""
-
-          echo "Debug keystore SHA256:"
-          sha256sum "$HOME/.android/debug.keystore"
-
-          echo ""
+          set -euo pipefail
 
           ./gradlew \
             assembleRelease \
             --stacktrace \
             --no-daemon
 
-
-      # ============================================================
-      # Build Debug
-      # ============================================================
-
       - name: Build Debug
-        if: github.event.inputs.build_type == 'Debug'
+        if: inputs.build_type == 'Debug'
         working-directory: source/android
         shell: bash
         run: |
-          set -e
-
-          echo "============================================"
-          echo "Build Android DEBUG"
-          echo "============================================"
-          echo ""
-
-          echo "Debug keystore SHA256:"
-          sha256sum "$HOME/.android/debug.keystore"
-
-          echo ""
+          set -euo pipefail
 
           ./gradlew \
             assembleDebug \
             --stacktrace \
             --no-daemon
 
-
-      # ============================================================
-      # Show Built APKs
-      # ============================================================
-
       - name: Show Built APKs
         shell: bash
         run: |
-          set -e
-
-          echo "============================================"
-          echo "Built APK files"
-          echo "============================================"
-          echo ""
+          set -euo pipefail
 
           APK_FOUND=false
 
@@ -389,38 +248,15 @@ jobs:
             exit 1
           fi
 
-
-      # ============================================================
-      # Verify APK Signature
-      #
-      # Pakai absolute path agar tidak tergantung PATH runner.
-      # ============================================================
-
-      - name: Verify APK Signature
+      - name: Verify APK Signatures
         shell: bash
         run: |
-          set -e
-
-          echo "============================================"
-          echo "APK Signature Verification"
-          echo "============================================"
-          echo ""
+          set -euo pipefail
 
           APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
 
-          echo "Using apksigner:"
-          echo "$APKSIGNER"
-
-          echo ""
-
           if [ ! -x "$APKSIGNER" ]; then
-            echo "::error::apksigner tidak ditemukan di:"
-            echo "$APKSIGNER"
-
-            echo ""
-            echo "Available Android build-tools:"
-            ls -la "$ANDROID_HOME/build-tools" || true
-
+            echo "::error::apksigner tidak ditemukan."
             exit 1
           fi
 
@@ -429,20 +265,12 @@ jobs:
           while IFS= read -r apk; do
             APK_FOUND=true
 
-            echo ""
-            echo "============================================"
-            echo "APK:"
-            echo "$apk"
-            echo "============================================"
-            echo ""
+            echo "Verifying: $apk"
 
             "$APKSIGNER" verify \
               --verbose \
               --print-certs \
               "$apk"
-
-            echo ""
-
           done < <(
             find source/android/app/build/outputs \
               -type f \
@@ -450,237 +278,136 @@ jobs:
           )
 
           if [ "$APK_FOUND" = false ]; then
-            echo "::error::Tidak ada APK yang ditemukan."
+            echo "::error::Tidak ada APK untuk diverifikasi."
             exit 1
           fi
-
-
-      # ============================================================
-      # Upload APK Artifact
-      # ============================================================
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Android-${{ github.event.inputs.build_type }}
+          name: Android-${{ inputs.build_type }}
           path: source/android/app/build/outputs/**/*.apk
           if-no-files-found: error
 
-
-      # ============================================================
-      # Prepare Release Tag
-      # ============================================================
-
-      - name: Prepare Release Tag
-        if: github.event.inputs.publish_release == 'true'
-        shell: bash
-        run: |
-          set -e
-
-          TAG="${{ github.event.inputs.tag }}"
-
-          # Ganti spasi dengan dash
-          TAG=$(echo "$TAG" | tr ' ' '-')
-
-          echo "TAG_NAME=$TAG" >> "$GITHUB_ENV"
-
-          echo "============================================"
-          echo "Release Tag"
-          echo "============================================"
-          echo ""
-          echo "$TAG"
-
-
-      # ============================================================
-      # Set Release Type
-      # ============================================================
-
-      - name: Set Release Type
-        if: github.event.inputs.publish_release == 'true'
-        shell: bash
-        run: |
-          set -e
-
-          if [ "${{ github.event.inputs.release_type }}" == "Prerelease" ]; then
-
-            echo "IS_PRERELEASE=true" >> "$GITHUB_ENV"
-
-            echo "Release type: Prerelease"
-
-          else
-
-            echo "IS_PRERELEASE=false" >> "$GITHUB_ENV"
-
-            echo "Release type: Release"
-
-          fi
-
-
-      # ============================================================
-      # Extract Commit Messages
-      # ============================================================
-
-      - name: Extract Commit Messages
-        if: github.event.inputs.publish_release == 'true' && github.event.inputs.commit_links != ''
-        id: commits
+      - name: Prepare Release Metadata
+        if: inputs.publish_release == true
+        id: release_metadata
         shell: bash
         env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_RELEASE_TYPE: ${{ inputs.release_type }}
+          INPUT_COMMIT_LINKS: ${{ inputs.commit_links }}
+          INPUT_MANUAL_DESCRIPTION: ${{ inputs.manual_description }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COMMIT_LINKS: ${{ github.event.inputs.commit_links }}
         run: |
-          set -e
+          set -euo pipefail
 
-          IFS='|' read -ra LINKS <<< "$COMMIT_LINKS"
+          TAG_NAME="${INPUT_TAG// /-}"
+
+          if [ "$INPUT_RELEASE_TYPE" = "Prerelease" ]; then
+            IS_PRERELEASE=true
+          else
+            IS_PRERELEASE=false
+          fi
+
+          {
+            echo "tag_name=$TAG_NAME"
+            echo "is_prerelease=$IS_PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -z "$INPUT_COMMIT_LINKS" ]; then
+            {
+              echo "release_body<<EOF"
+              echo "$INPUT_MANUAL_DESCRIPTION"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          DESCRIPTION_FILE="$RUNNER_TEMP/commit_description.txt"
 
           {
             echo "## Commits Included"
-            echo ""
+            echo
+
+            IFS='|' read -ra LINKS <<< "$INPUT_COMMIT_LINKS"
 
             for link in "${LINKS[@]}"; do
+              link="$(echo "$link" | xargs)"
 
-              # Trim whitespace
-              link=$(echo "$link" | xargs)
-
-              if [ -z "$link" ]; then
-                continue
-              fi
-
-              echo "Processing commit URL: $link" >&2
-
-              # Expected:
-              #
-              # https://github.com/OWNER/REPO/commit/HASH
+              [ -z "$link" ] && continue
 
               if [[ "$link" =~ github\.com/([^/]+)/([^/]+)/commit/([a-fA-F0-9]+) ]]; then
-
                 OWNER="${BASH_REMATCH[1]}"
                 REPO="${BASH_REMATCH[2]}"
                 COMMIT_HASH="${BASH_REMATCH[3]}"
                 SHORT_HASH="${COMMIT_HASH:0:7}"
 
-                COMMIT_DATA=$(curl -fsSL \
-                  -H "Authorization: Bearer $GH_TOKEN" \
-                  -H "Accept: application/vnd.github+json" \
-                  "https://api.github.com/repos/$OWNER/$REPO/commits/$COMMIT_HASH" \
-                  || true)
+                COMMIT_DATA="$(
+                  curl -fsSL \
+                    -H "Authorization: Bearer $GH_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/$OWNER/$REPO/commits/$COMMIT_HASH" \
+                    || true
+                )"
 
-                COMMIT_MESSAGE=$(echo "$COMMIT_DATA" \
-                  | jq -r '.commit.message // empty' \
-                  2>/dev/null \
-                  || true)
+                COMMIT_MESSAGE="$(
+                  echo "$COMMIT_DATA" |
+                    jq -r '.commit.message // empty' 2>/dev/null || true
+                )"
 
                 if [ -n "$COMMIT_MESSAGE" ]; then
-
-                  COMMIT_TITLE=$(echo "$COMMIT_MESSAGE" | head -1)
+                  COMMIT_TITLE="$(echo "$COMMIT_MESSAGE" | head -1)"
 
                   echo "### [$SHORT_HASH]($link) $COMMIT_TITLE"
-                  echo ""
+                  echo
 
-                  COMMIT_BODY=$(echo "$COMMIT_MESSAGE" \
-                    | tail -n +2 \
-                    | sed '/^$/d')
+                  COMMIT_BODY="$(
+                    echo "$COMMIT_MESSAGE" |
+                      tail -n +2 |
+                      sed '/^$/d'
+                  )"
 
                   if [ -n "$COMMIT_BODY" ]; then
-
                     echo '```'
                     echo "$COMMIT_BODY"
                     echo '```'
-                    echo ""
-
+                    echo
                   fi
-
                 else
-
                   echo "### [$SHORT_HASH]($link)"
-                  echo ""
+                  echo
                   echo "_Commit message tidak dapat diambil._"
-                  echo ""
-
+                  echo
                 fi
-
               else
-
                 echo "### $link"
-                echo ""
+                echo
                 echo "_Invalid GitHub commit URL._"
-                echo ""
-
+                echo
               fi
-
             done
-
-          } > /tmp/commit_description.txt
+          } > "$DESCRIPTION_FILE"
 
           {
-            echo "commit_description<<EOF"
-            cat /tmp/commit_description.txt
+            echo "release_body<<EOF"
+            cat "$DESCRIPTION_FILE"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-
-      # ============================================================
-      # Determine Release Body
-      # ============================================================
-
-      - name: Determine Release Body
-        if: github.event.inputs.publish_release == 'true'
-        id: body
-        shell: bash
-        env:
-          MANUAL_DESC: ${{ github.event.inputs.manual_description }}
-          COMMIT_LINKS: ${{ github.event.inputs.commit_links }}
-        run: |
-          set -e
-
-          if [ -z "$COMMIT_LINKS" ]; then
-
-            {
-              echo "release_body<<EOF"
-              echo "$MANUAL_DESC"
-              echo "EOF"
-            } >> "$GITHUB_OUTPUT"
-
-          else
-
-            {
-              echo "release_body<<EOF"
-
-              if [ -f /tmp/commit_description.txt ]; then
-
-                cat /tmp/commit_description.txt
-
-              else
-
-                echo "## Changelog"
-                echo ""
-                echo "Commit description unavailable."
-
-              fi
-
-              echo "EOF"
-
-            } >> "$GITHUB_OUTPUT"
-
-          fi
-
-
-      # ============================================================
-      # Publish GitHub Release
-      # ============================================================
-
       - name: Publish GitHub Release
-        if: github.event.inputs.publish_release == 'true'
+        if: inputs.publish_release == true
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.TAG_NAME }}
-          name: ${{ github.event.inputs.release_title }}
-          body: ${{ steps.body.outputs.release_body }}
+          tag_name: ${{ steps.release_metadata.outputs.tag_name }}
+          name: ${{ inputs.release_title }}
+          body: ${{ steps.release_metadata.outputs.release_body }}
           generate_release_notes: false
           draft: false
-          prerelease: ${{ env.IS_PRERELEASE }}
+          prerelease: ${{ steps.release_metadata.outputs.is_prerelease }}
           overwrite_files: true
           files: |
             source/android/app/build/outputs/**/*.apk
-
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
