@@ -71,6 +71,8 @@ jobs:
 
     env:
       GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx8g"
+      # Opus (audiopus_sys) ships cmake_minimum_required < 3.5; runner CMake 4.x dropped that compat. Env propagates to all nested cmake configures.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
     steps:
       - name: Checkout Builder Repository
