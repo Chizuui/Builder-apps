@@ -1,0 +1,415 @@
+name: Build Android
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: Repository (owner/repo)
+        required: true
+        default: Chizuui/OpenNOW-Modified
+
+      branch:
+        description: Branch
+        required: true
+        default: chizui-dev-bak
+
+      build_type:
+        description: Build Type
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Debug
+
+      publish_release:
+        description: Publish GitHub Release
+        required: true
+        default: true
+        type: boolean
+
+      release_type:
+        description: Release Type
+        required: true
+        default: Release
+        type: choice
+        options:
+          - Release
+          - Prerelease
+
+      tag:
+        description: Release Tag
+        required: true
+        default: v1.0.0-build-1
+
+      release_title:
+        description: Release Title
+        required: true
+        default: OpenNOW Android
+
+      commit_links:
+        description: Commit links, separated by |
+        required: false
+        default: ""
+
+      manual_description:
+        description: Release description
+        required: false
+        default: |
+          ## Changelog
+          - Built with GitHub Actions
+          - Latest features included
+
+jobs:
+  build:
+    name: Build Android
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx8g"
+
+    steps:
+      - name: Checkout Builder Repository
+        uses: actions/checkout@v4
+
+      - name: Clone Target Repository
+        shell: bash
+        env:
+          TARGET_REPOSITORY: ${{ inputs.repository }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+
+          git clone \
+            --recursive \
+            --branch "$TARGET_BRANCH" \
+            "https://github.com/$TARGET_REPOSITORY.git" \
+            source
+
+          cd source
+          git submodule update --init --recursive
+
+          echo "Target repository: $TARGET_REPOSITORY"
+          echo "Target branch: $TARGET_BRANCH"
+          echo "Target commit:"
+          git log -1 --oneline
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: >
+            aarch64-linux-android,
+            armv7-linux-androideabi,
+            x86_64-linux-android,
+            i686-linux-android
+
+      - name: Verify Build Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 --version
+          rustc --version
+          cargo --version
+          rustup target list --installed
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      - name: Accept Android SDK Licenses
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses || true
+
+      - name: Install Android SDK Components
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "cmake;3.22.1" \
+            "ndk;29.0.13846066"
+
+      - name: Add Android Build Tools to PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BUILD_TOOLS_PATH="$ANDROID_HOME/build-tools/36.0.0"
+
+          if [ ! -d "$BUILD_TOOLS_PATH" ]; then
+            echo "::error::Android Build Tools tidak ditemukan."
+            exit 1
+          fi
+
+          echo "$BUILD_TOOLS_PATH" >> "$GITHUB_PATH"
+
+      - name: Install Builder Debug Keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SOURCE_KEYSTORE="$GITHUB_WORKSPACE/debug.keystore"
+          TARGET_DIR="$HOME/.android"
+          TARGET_KEYSTORE="$TARGET_DIR/debug.keystore"
+
+          if [ ! -f "$SOURCE_KEYSTORE" ]; then
+            echo "::error::debug.keystore tidak ditemukan di root builder repository."
+            exit 1
+          fi
+
+          mkdir -p "$TARGET_DIR"
+          rm -f "$TARGET_KEYSTORE"
+          cp "$SOURCE_KEYSTORE" "$TARGET_KEYSTORE"
+          chmod 600 "$TARGET_KEYSTORE"
+
+          echo "Debug keystore SHA256:"
+          sha256sum "$TARGET_KEYSTORE"
+
+      - name: Verify Debug Keystore
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          keytool \
+            -list \
+            -v \
+            -keystore "$HOME/.android/debug.keystore" \
+            -storepass android \
+            -alias androiddebugkey
+
+      - name: Make Gradle Executable
+        working-directory: source/android
+        shell: bash
+        run: |
+          chmod +x gradlew
+
+      - name: Build Release
+        if: inputs.build_type == 'Release'
+        working-directory: source/android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./gradlew \
+            assembleRelease \
+            --stacktrace \
+            --no-daemon
+
+      - name: Build Debug
+        if: inputs.build_type == 'Debug'
+        working-directory: source/android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ./gradlew \
+            assembleDebug \
+            --stacktrace \
+            --no-daemon
+
+      - name: Show Built APKs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK_FOUND=false
+
+          while IFS= read -r apk; do
+            APK_FOUND=true
+            echo "$apk"
+          done < <(
+            find source/android/app/build/outputs \
+              -type f \
+              -name "*.apk"
+          )
+
+          if [ "$APK_FOUND" = false ]; then
+            echo "::error::Tidak ada APK yang ditemukan."
+            exit 1
+          fi
+
+      - name: Verify APK Signatures
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$ANDROID_HOME/build-tools/36.0.0/apksigner"
+
+          if [ ! -x "$APKSIGNER" ]; then
+            echo "::error::apksigner tidak ditemukan."
+            exit 1
+          fi
+
+          APK_FOUND=false
+
+          while IFS= read -r apk; do
+            APK_FOUND=true
+
+            echo "Verifying: $apk"
+
+            "$APKSIGNER" verify \
+              --verbose \
+              --print-certs \
+              "$apk"
+          done < <(
+            find source/android/app/build/outputs \
+              -type f \
+              -name "*.apk"
+          )
+
+          if [ "$APK_FOUND" = false ]; then
+            echo "::error::Tidak ada APK untuk diverifikasi."
+            exit 1
+          fi
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-${{ inputs.build_type }}
+          path: source/android/app/build/outputs/**/*.apk
+          if-no-files-found: error
+
+      - name: Prepare Release Metadata
+        if: inputs.publish_release == true
+        id: release_metadata
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          INPUT_RELEASE_TYPE: ${{ inputs.release_type }}
+          INPUT_COMMIT_LINKS: ${{ inputs.commit_links }}
+          INPUT_MANUAL_DESCRIPTION: ${{ inputs.manual_description }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          TAG_NAME="${INPUT_TAG// /-}"
+
+          if [ "$INPUT_RELEASE_TYPE" = "Prerelease" ]; then
+            IS_PRERELEASE=true
+          else
+            IS_PRERELEASE=false
+          fi
+
+          {
+            echo "tag_name=$TAG_NAME"
+            echo "is_prerelease=$IS_PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ -z "$INPUT_COMMIT_LINKS" ]; then
+            {
+              echo "release_body<<EOF"
+              echo "$INPUT_MANUAL_DESCRIPTION"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+
+            exit 0
+          fi
+
+          DESCRIPTION_FILE="$RUNNER_TEMP/commit_description.txt"
+
+          {
+            echo "## Commits Included"
+            echo
+
+            IFS='|' read -ra LINKS <<< "$INPUT_COMMIT_LINKS"
+
+            for link in "${LINKS[@]}"; do
+              link="$(echo "$link" | xargs)"
+
+              [ -z "$link" ] && continue
+
+              if [[ "$link" =~ github\.com/([^/]+)/([^/]+)/commit/([a-fA-F0-9]+) ]]; then
+                OWNER="${BASH_REMATCH[1]}"
+                REPO="${BASH_REMATCH[2]}"
+                COMMIT_HASH="${BASH_REMATCH[3]}"
+                SHORT_HASH="${COMMIT_HASH:0:7}"
+
+                COMMIT_DATA="$(
+                  curl -fsSL \
+                    -H "Authorization: Bearer $GH_TOKEN" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/$OWNER/$REPO/commits/$COMMIT_HASH" \
+                    || true
+                )"
+
+                COMMIT_MESSAGE="$(
+                  echo "$COMMIT_DATA" |
+                    jq -r '.commit.message // empty' 2>/dev/null || true
+                )"
+
+                if [ -n "$COMMIT_MESSAGE" ]; then
+                  COMMIT_TITLE="$(echo "$COMMIT_MESSAGE" | head -1)"
+
+                  echo "### [$SHORT_HASH]($link) $COMMIT_TITLE"
+                  echo
+
+                  COMMIT_BODY="$(
+                    echo "$COMMIT_MESSAGE" |
+                      tail -n +2 |
+                      sed '/^$/d'
+                  )"
+
+                  if [ -n "$COMMIT_BODY" ]; then
+                    echo '```'
+                    echo "$COMMIT_BODY"
+                    echo '```'
+                    echo
+                  fi
+                else
+                  echo "### [$SHORT_HASH]($link)"
+                  echo
+                  echo "_Commit message tidak dapat diambil._"
+                  echo
+                fi
+              else
+                echo "### $link"
+                echo
+                echo "_Invalid GitHub commit URL._"
+                echo
+              fi
+            done
+          } > "$DESCRIPTION_FILE"
+
+          {
+            echo "release_body<<EOF"
+            cat "$DESCRIPTION_FILE"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        if: inputs.publish_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release_metadata.outputs.tag_name }}
+          name: ${{ inputs.release_title }}
+          body: ${{ steps.release_metadata.outputs.release_body }}
+          generate_release_notes: false
+          draft: false
+          prerelease: ${{ steps.release_metadata.outputs.is_prerelease }}
+          overwrite_files: true
+          files: |
+            source/android/app/build/outputs/**/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
